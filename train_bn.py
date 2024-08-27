@@ -1,6 +1,6 @@
 import argparse
 import os 
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 import torch
 
 from dassl.utils import setup_logger, set_random_seed, collect_env_info
@@ -25,8 +25,7 @@ import datasets.pacs
 import datasets.vlcs
 import datasets.domainnet
 
-import trainers.meta
-from trainers.imagenet_templates import get_dataset_specified_config
+import trainers.meta_aug
 import trainers.zsclip
 
 
@@ -92,19 +91,19 @@ def extend_cfg(cfg):
     cfg.TRAINER.META = CN()
     cfg.TRAINER.META.MODE = 'D'  # number of context vectors
     cfg.TRAINER.META.N_CTX = 2  # number of context vectors
-    cfg.TRAINER.META.N_PRO = 2
-    cfg.TRAINER.META.ADAPT_LR = 0.002
-    cfg.TRAINER.META.LR_RATIO = 1.0
-    cfg.TRAINER.META.LAYERS = 12
-    cfg.TRAINER.META.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.META.N_PRO = 2  # number of prompt vectors
     cfg.TRAINER.META.ALPHA = 0.1
+    cfg.TRAINER.META.ADAPT_LR = 0.0025
+    cfg.TRAINER.META.LR_RATIO = 1.0
+    cfg.TRAINER.META.LAYERS = 12  # number of prompt vectors
+    cfg.TRAINER.META.PREC = "fp16"  # fp16, fp32, amp
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
     cfg.DATASET.ID = 0
 
     cfg.OPTIM_META = CN()
-    cfg.OPTIM_META.NAME = "sgd"
-    cfg.OPTIM_META.LR = 0.002
-    cfg.OPTIM_META.WEIGHT_DECAY = 0.005
+    cfg.OPTIM_META.NAME = "adam"
+    cfg.OPTIM_META.LR = 0.0003
+    cfg.OPTIM_META.WEIGHT_DECAY = 5e-4
     cfg.OPTIM_META.MOMENTUM = 0.9
     cfg.OPTIM_META.SGD_DAMPNING = 0
     cfg.OPTIM_META.SGD_NESTEROV = False
@@ -121,23 +120,23 @@ def extend_cfg(cfg):
     cfg.OPTIM_META.NEW_LAYERS = ()
     cfg.OPTIM_META.BASE_LR_MULT = 0.1
     # Learning rate scheduler
-    cfg.OPTIM_META.LR_SCHEDULER = "cosine"
+    cfg.OPTIM_META.LR_SCHEDULER = "single_step"
     # -1 or 0 means the stepsize is equal to max_epoch
     cfg.OPTIM_META.STEPSIZE = (-1, )
     cfg.OPTIM_META.GAMMA = 0.1
     cfg.OPTIM_META.MAX_EPOCH = 10
     # Set WARMUP_EPOCH larger than 0 to activate warmup training
     cfg.OPTIM_META.WARMUP_EPOCH = -1
-    # # Either linear or constant
-    # cfg.OPTIM_META.WARMUP_TYPE = "linear"
-    # # Constant learning rate when type=constant
-    # cfg.OPTIM_META.WARMUP_CONS_LR = 1e-5
-    # # Minimum learning rate when type=linear
-    # cfg.OPTIM_META.WARMUP_MIN_LR = 1e-5
+    # Either linear or constant
+    cfg.OPTIM_META.WARMUP_TYPE = "linear"
+    # Constant learning rate when type=constant
+    cfg.OPTIM_META.WARMUP_CONS_LR = 1e-5
+    # Minimum learning rate when type=linear
+    cfg.OPTIM_META.WARMUP_MIN_LR = 1e-5
     # Recount epoch for the next scheduler (last_epoch=-1)
     # Otherwise last_epoch=warmup_epoch
-    # cfg.OPTIM_META.WARMUP_RECOUNT = True
-
+    cfg.OPTIM_META.WARMUP_RECOUNT = True
+    
 def setup_cfg(args):
     cfg = get_cfg_default()
     extend_cfg(cfg)
@@ -155,9 +154,6 @@ def setup_cfg(args):
 
     # 4. From optional input arguments
     cfg.merge_from_list(args.opts)
-
-    # 5. Override dataset specific config
-    cfg.merge_from_list(get_dataset_specified_config(cfg.DATASET.NAME))
 
     cfg.freeze()
 
@@ -187,8 +183,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="", help="path to dataset")
-    parser.add_argument("--output-dir", type=str, default="", help="output directory")
+    parser.add_argument("--root", type=str, default="../DATA", help="path to dataset")
+    parser.add_argument("--output-dir", type=str, default=".", help="output directory")
     parser.add_argument(
         "--resume",
         type=str,
@@ -208,18 +204,18 @@ if __name__ == "__main__":
         "--transforms", type=str, nargs="+", help="data augmentation methods"
     )
     parser.add_argument(
-        "--config-file", type=str, default="", help="path to config file"
+        "--config-file", type=str, default="configs/trainers/Meta_B2N_AUG/vit_b16_aug.yaml", help="path to config file"
     )
     parser.add_argument(
         "--dataset-config-file",
         type=str,
-        default="",
+        default="configs/datasets/b2n/eurosat.yaml",
         help="path to config file for dataset setup",
     )
-    parser.add_argument("--trainer", type=str, default="", help="name of trainer")
+    parser.add_argument("--trainer", type=str, default="Meta_B2N_AUG", help="name of trainer")
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
     parser.add_argument("--head", type=str, default="", help="name of head")
-    parser.add_argument("--eval-only", action="store_true", help="evaluation only")
+    parser.add_argument("--eval-only", action="store_true",default=False, help="evaluation only")
     parser.add_argument(
         "--model-dir",
         type=str,

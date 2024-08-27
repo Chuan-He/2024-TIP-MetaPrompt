@@ -5,8 +5,9 @@ TRAINER=Meta_B2N
 SHOTS=16
 LOADEP=10
 CFG=vit_b16
-DATASET=fgvc_aircraft
 
+for DATASET in eurosat fgvc_aircraft #dtd oxford_flowers food101 stanford_cars oxford_pets ucf101 caltech101 #sun397 #imagenet
+do
 for SEED in 1 2 3 4 5
 do 
 
@@ -46,4 +47,5 @@ do
         DATASET.SUBSAMPLE_CLASSES new
     fi
 
+done
 done

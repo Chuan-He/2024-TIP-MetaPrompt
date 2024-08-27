@@ -322,6 +322,64 @@ class CustomCLIP(nn.Module):
 
         return bbx1, bby1, bbx2, bby2
 
+    def forward_mix_2(self, image, image2, label):
+        tokenized_prompts = self.tokenized_prompts
+        logit_scale = self.logit_scale.exp()
+
+        # Now calculate the frozen pre-trained features
+        fixed_embeddings = self.text_features_zs  # precomputed pre-trained frozen textual features
+        fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
+        with torch.no_grad():
+            zero_shot_features = self.model.encode_image(image.type(self.dtype))
+            zero_shot_features = zero_shot_features / zero_shot_features.norm(dim=-1, keepdim=True)
+            # Compute pre-trained frozen visual features
+            zero_shot_logits = logit_scale * zero_shot_features.cuda() @ fixed_embeddings.half().cuda().t()
+
+        # generate mixed sample
+        if self.alpha > 0.:
+            lam = np.random.beta(self.alpha, self.alpha)
+        else:
+            lam = 1.
+        batch_size = image.size()[0]
+        index = torch.randperm(batch_size).cuda()
+        target_a = label
+        target_b = label[index]
+        mixed_image = lam * image + (1 - lam) * image2[index,:]
+
+        prompts, ctx_t = self.prompt_learner()
+        # Compute the prompted image and text features
+        text_features = self.text_encoder(prompts, tokenized_prompts, ctx_t)
+        x, ctx_v = self.vision_prompt_learner(mixed_image.type(self.dtype))
+        image_features = self.image_encoder(x, ctx_v.type(self.dtype))
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        # Compute the prompted logits
+        logits = logit_scale * image_features @ text_features.t()
+        # compute output
+        ce_loss = F.cross_entropy(logits, target_a) * lam + F.cross_entropy(logits, target_b) * (1. - lam)
+    
+        # Now calculate L_SCL_logits
+        # kl_loss = F.kl_div(
+        #     F.log_softmax(logits / 1, dim=1),
+        #     F.log_softmax(zero_shot_logits / 1, dim=1),
+        #     reduction='sum',
+        #     log_target=True
+        # ) * (1 * 1) / logits.numel()
+
+        kl_loss = F.kl_div(
+            F.log_softmax(logits / 1, dim=1),
+            F.log_softmax(zero_shot_logits / 1, dim=1),
+            reduction='sum'
+        ) * (1 * 1) / logits.numel()
+
+        reg_text = F.l1_loss(text_features, fixed_embeddings,
+                                    reduction='mean')
+        reg_image = F.l1_loss(image_features, zero_shot_features,
+                                    reduction='mean')
+
+        return ce_loss, kl_loss, reg_image, reg_text
+
     def forward_mix(self, image, label):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
@@ -514,7 +572,7 @@ class MAMLFewShotClassifier(nn.Module):
     #         self._optims[name].step()
 
 @TRAINER_REGISTRY.register()
-class Meta_B2N(TrainerX):
+class Meta_B2N_AUG(TrainerX):
 
     def check_cfg(self, cfg):
         assert cfg.TRAINER.META.PREC in ["fp16", "fp32", "amp"]
@@ -630,12 +688,8 @@ class Meta_B2N(TrainerX):
     
         angle_t = torch.dot(grad_ce_t_norm.flatten(), grad_reg_t_norm.flatten())
         angle_i = torch.dot(grad_ce_i_norm.flatten(), grad_reg_i_norm.flatten())
-
-        if angle_t < 0:
-            ctx.grad = grad_ce_t - 1.0 * torch.dot(grad_ce_t.flatten(), grad_reg_t_norm.flatten()) * grad_reg_t_norm
-        else:
-            ctx.grad = grad_ce_t
         
+        ctx.grad = grad_ce_t    
         vis_ctx.grad = grad_ce_i
 
 
@@ -672,8 +726,8 @@ class Meta_B2N(TrainerX):
         ctx.grad = None
 
     def forward_backward(self, batch):
-        #image, image2, label = self.parse_batch_train_2(batch)
-        image, label = self.parse_batch_train(batch)
+        image, image2, label = self.parse_batch_train(batch)
+        #image, label = self.parse_batch_train(batch)
 
         #lr=self.get_current_lr()
         # logits, kl_loss, reg_image, reg_text = self.model(image)
@@ -695,11 +749,18 @@ class Meta_B2N(TrainerX):
         # self.meta_gradient_update_image(loss_ce, kl_loss, reg_image, reg_text)
         # self.optim.step()
 
-        loss_ce, kl_loss, reg_image, reg_text = self.model.forward_mix(image, label)
+        loss_ce, kl_loss, reg_image, reg_text = self.model.forward_mix_2(image, image2, label)
 
         self.optim.zero_grad()
         self.meta_gradient_update(loss_ce, kl_loss, reg_image, reg_text)
         self.optim.step()
+
+        # logits, kl_loss, reg_image, reg_text = self.model(image2)
+        # loss_ce = F.cross_entropy(logits, label)
+
+        # self.optim.zero_grad()
+        # self.meta_gradient_update(loss_ce, kl_loss, reg_image, reg_text)
+        # self.optim.step()
 
         # loss = torch.tensor(0.0)
         # unique_label = torch.unique(label)
@@ -738,13 +799,8 @@ class Meta_B2N(TrainerX):
             self.update_lr()
 
         return loss_summary
-
-    def parse_batch_train(self, batch):
-        input = batch["img"].to(self.device)
-        label = batch["label"].to(self.device)
-        return input, label
     
-    def parse_batch_train_2(self, batch):
+    def parse_batch_train(self, batch):
         input = batch["img"]
         image1, image2 = input[0], input[1]
         label = batch["label"]

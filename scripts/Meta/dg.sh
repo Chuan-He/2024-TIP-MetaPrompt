@@ -1,11 +1,12 @@
 #!/bin/bash
 
-DATA=./data
+cd ../..
+DATA=../DATA
 TRAINER=Meta_DG
 CFG=vit_b16
 
-DATASET=$1
-SHOTS=$2
+DATASET=office_home
+SHOTS=16
 
 if [ "$DATASET" == "domainnet" ]; then
     N=6

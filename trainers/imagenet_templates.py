@@ -1,4 +1,68 @@
 # source: https://github.com/openai/CLIP/blob/main/notebooks/Prompt_Engineering_for_ImageNet.ipynb
+def get_dataset_specified_config(dataset):
+    """Get dataset specific."""
+    cfg = {
+        "ImageNet": {
+            "TRAINER.META.LAYERS": 12,
+            "TRAINER.META.N_CTX": 2,
+            "TRAINER.META.N_PRO": 2,
+        },
+        "Caltech101": {
+            "TRAINER.META.LAYERS": 9,
+            "TRAINER.META.N_CTX": 4,
+            "TRAINER.META.N_PRO": 4,
+        },
+        "OxfordPets": {
+            "TRAINER.META.LAYERS": 9,
+            "TRAINER.META.N_CTX": 4,
+            "TRAINER.META.N_PRO": 4,
+        },
+        "StanfordCars": {
+            "TRAINER.META.LAYERS": 9,
+            "TRAINER.META.N_CTX": 4,
+            "TRAINER.META.N_PRO": 4,
+        },
+        "OxfordFlowers": {
+            "TRAINER.META.LAYERS": 9,
+            "TRAINER.META.N_CTX": 4,
+            "TRAINER.META.N_PRO": 4,
+        },
+        "Food101": {
+            "TRAINER.META.LAYERS": 9,
+            "TRAINER.META.N_CTX": 4,
+            "TRAINER.META.N_PRO": 4,
+            #"OPTIM.MAX_EPOCH": 5,
+        },
+        "FGVCAircraft": {
+            "TRAINER.META.LAYERS": 12,
+            "TRAINER.META.N_CTX": 2,
+            "TRAINER.META.N_PRO": 2,
+            #"TRAINER.META.ALPHA": 0.1,
+            #"DATALOADER.TRAIN_X.BATCH_SIZE": 4,
+        },
+        "SUN397": {
+            "TRAINER.META.LAYERS": 12,
+            "TRAINER.META.N_CTX": 2,
+            "TRAINER.META.N_PRO": 2,
+        },
+        "DescribableTextures": {
+            "TRAINER.META.LAYERS": 9,
+            "TRAINER.META.N_CTX": 4,
+            "TRAINER.META.N_PRO": 4,
+        },
+        "EuroSAT": {
+            "TRAINER.META.LAYERS": 12,
+            "TRAINER.META.N_CTX": 2,
+            "TRAINER.META.N_PRO": 2,
+        },
+        "UCF101": {
+            "TRAINER.META.LAYERS": 9,
+            "TRAINER.META.N_CTX": 4,
+            "TRAINER.META.N_PRO": 4,
+        },
+    }.get(dataset, {})
+
+    return " ".join([f"{k} {v}" for k, v in cfg.items()]).split(" ")
 
 IMAGENET_TEMPLATES = [
     "a bad photo of a {}.",

@@ -630,12 +630,8 @@ class Meta_B2N(TrainerX):
     
         angle_t = torch.dot(grad_ce_t_norm.flatten(), grad_reg_t_norm.flatten())
         angle_i = torch.dot(grad_ce_i_norm.flatten(), grad_reg_i_norm.flatten())
-
-        if angle_t < 0:
-            ctx.grad = grad_ce_t - 1.0 * torch.dot(grad_ce_t.flatten(), grad_reg_t_norm.flatten()) * grad_reg_t_norm
-        else:
-            ctx.grad = grad_ce_t
         
+        ctx.grad = grad_ce_t    
         vis_ctx.grad = grad_ce_i
 
 

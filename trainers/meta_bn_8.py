@@ -16,9 +16,6 @@ from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 import torch.optim as optim
 import math
-import learn2learn as l2l
-from . import maml
-import numpy as np
 
 from copy import deepcopy
 
@@ -166,6 +163,7 @@ class PromptLearner(nn.Module):
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
         self.layer_p = cfg.TRAINER.META.LAYERS
 
+        
         # use given words to initialize context vectors
         ctx_init = 'a photo of a'
         ctx_init = ctx_init.replace("_", " ")
@@ -279,7 +277,6 @@ class CustomCLIP(nn.Module):
         self.dtype = clip_model.dtype
         self.model = clip_model
         self.classname = classnames
-        self.alpha = cfg.TRAINER.META.ALPHA
 
         # self.VPT_image_trans = Feature_Trans_Module_two_layer(512, 512)
         # self.VPT_image_trans = self.VPT_image_trans.cuda()
@@ -304,27 +301,26 @@ class CustomCLIP(nn.Module):
                 all_teacher_features.append(text_features.unsqueeze(1))
             self.text_features_zs = torch.cat(all_teacher_features, dim=1).mean(dim=1)
 
-    def rand_bbox(self, size, lam):
-        W = size[2]
-        H = size[3]
-        cut_rat = np.sqrt(1. - lam)
-        cut_w = int(W * cut_rat)
-        cut_h = int(H * cut_rat)
-
-        # uniform
-        cx = np.random.randint(W)
-        cy = np.random.randint(H)
-
-        bbx1 = np.clip(cx - cut_w // 2, 0, W)
-        bby1 = np.clip(cy - cut_h // 2, 0, H)
-        bbx2 = np.clip(cx + cut_w // 2, 0, W)
-        bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-        return bbx1, bby1, bbx2, bby2
-
-    def forward_mix(self, image, label):
+    def forward_mix(self, image, label, image_sup, label_sup, mix_ids, lam):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
+
+        prompts, ctx_t = self.prompt_learner()
+        # Compute the prompted image and text features
+        text_features = self.text_encoder(prompts, tokenized_prompts, ctx_t)
+        x, ctx_v = self.vision_prompt_learner(image.type(self.dtype))
+        image_features = self.image_encoder(x, ctx_v.half())
+ 
+        b_size = image.size(0)
+        x_sup, sup_ctx_v = self.vision_prompt_learner(image_sup.type(self.dtype))
+        image_features_sup = self.image_encoder(x_sup, sup_ctx_v.half())
+        image_features = lam.view(b_size, 1)*image_features + (1-lam).view(b_size,1)*image_features_sup[mix_ids]
+        label_b = label_sup[mix_ids]
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        # Compute the prompted logits
+        logits = logit_scale * image_features @ text_features.t()
 
         # Now calculate the frozen pre-trained features
         fixed_embeddings = self.text_features_zs  # precomputed pre-trained frozen textual features
@@ -334,43 +330,15 @@ class CustomCLIP(nn.Module):
             zero_shot_features = zero_shot_features / zero_shot_features.norm(dim=-1, keepdim=True)
             # Compute pre-trained frozen visual features
             zero_shot_logits = logit_scale * zero_shot_features.cuda() @ fixed_embeddings.half().cuda().t()
-
-        # generate mixed sample
-        if self.alpha > 0.:
-            lam = np.random.beta(self.alpha, self.alpha)
-        else:
-            lam = 1.
-        batch_size = image.size()[0]
-        index = torch.randperm(batch_size).cuda()
-        target_a = label
-        target_b = label[index]
-        mixed_image = lam * image + (1 - lam) * image[index,:]
-
-        prompts, ctx_t = self.prompt_learner()
-        # Compute the prompted image and text features
-        text_features = self.text_encoder(prompts, tokenized_prompts, ctx_t)
-        x, ctx_v = self.vision_prompt_learner(mixed_image.type(self.dtype))
-        image_features = self.image_encoder(x, ctx_v.type(self.dtype))
-
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        # Compute the prompted logits
-        logits = logit_scale * image_features @ text_features.t()
-        # compute output
-        ce_loss = F.cross_entropy(logits, target_a) * lam + F.cross_entropy(logits, target_b) * (1. - lam)
+        
+        ce_loss = (lam*F.cross_entropy(logits, label, reduce=False)+(1-lam)*F.cross_entropy(logits, label_b, reduce=False)).mean()
     
         # Now calculate L_SCL_logits
-        # kl_loss = F.kl_div(
-        #     F.log_softmax(logits / 1, dim=1),
-        #     F.log_softmax(zero_shot_logits / 1, dim=1),
-        #     reduction='sum',
-        #     log_target=True
-        # ) * (1 * 1) / logits.numel()
-
         kl_loss = F.kl_div(
             F.log_softmax(logits / 1, dim=1),
             F.log_softmax(zero_shot_logits / 1, dim=1),
-            reduction='sum'
+            reduction='sum',
+            log_target=True
         ) * (1 * 1) / logits.numel()
 
         reg_text = F.l1_loss(text_features, fixed_embeddings,
@@ -404,7 +372,7 @@ class CustomCLIP(nn.Module):
 
         x, ctx_v = self.vision_prompt_learner(image)
         image_features = self.image_encoder(x, ctx_v.half())
-
+        #image_features = self.VPT_image_trans(image_features.float()).half()
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
@@ -417,11 +385,6 @@ class CustomCLIP(nn.Module):
             log_target=True
         ) * (1 * 1) / logits_ce.numel()
 
-        # tea_prob = F.softmax(zero_shot_logits, dim=-1)
-        # kl_loss = -tea_prob * F.log_softmax(logits_ce,
-        #                                     -1)
-        # kl_loss = kl_loss.sum(1).mean()
-
         reg_text = F.l1_loss(text_features, text_features_zs,
                                     reduction='mean')
         reg_image = F.l1_loss(image_features, image_features_zs,
@@ -431,6 +394,7 @@ class CustomCLIP(nn.Module):
             return logits_ce, kl_loss, reg_image, reg_text
         else:
             return logits_ce
+ 
 
 class MAMLFewShotClassifier(nn.Module):
     def __init__(self, device):
@@ -533,205 +497,71 @@ class Meta_B2N(TrainerX):
 
         #self.meta_step = cfg.TRAINER.META.META_STEP
         self.num_layers = cfg.TRAINER.META.LAYERS
-        self.batch_size = cfg.DATALOADER.TRAIN_X.BATCH_SIZE
+        self.steps = cfg.TRAINER.META.INNER_LOOP_STEPS
         self.total_epochs = cfg.OPTIM.MAX_EPOCH
-        self.adapt_lr = cfg.TRAINER.META.ADAPT_LR
-        self.lr_ratio = cfg.TRAINER.META.LR_RATIO
-        self.classnames = classnames
-        self.fast_adaptation = False
+        self.init_lr = cfg.TRAINER.META.INIT_LR
+        #self.init_wd = cfg.OPTIM_META.WEIGHT_DECAY
         
         print("Building custom CLIP")
-        print(f'BATCH_SIZE: {self.batch_size} Layers: {self.num_layers} N_CTX: {cfg.TRAINER.META.N_CTX} ALPHA: {cfg.TRAINER.META.ALPHA}')
+        print(self.num_layers)
         self.model = CustomCLIP(cfg, classnames, clip_model)
-        # self.vnet = maml.VNet(cfg, clip_model)
+        self.meta_model = MAMLFewShotClassifier(self.device)
 
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
             if "prompt_learner" not in name:
                 param.requires_grad_(False)
+            # if "VPT_image_trans" in name:
+            #     param.requires_grad_(True)
         
         enabled = set()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
         
-        # for name, param in self.vnet.named_parameters():
-        #     if param.requires_grad:
-        #         enabled.add(name)          
+        for name, param in self.meta_model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)          
         print(f"Parameters to be updated: {enabled}")
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        # self.vnet.to(self.device)
+        self.meta_model.to(self.device)
         self.optim = build_optimizer(self.model, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         
-        # self.optim_vnet = build_optimizer(self.vnet, cfg.OPTIM_META)
-        # self.sched_vnet = build_lr_scheduler(self.optim_vnet, cfg.OPTIM_META)
+        self.meta_optim = build_optimizer(self.meta_model, cfg.OPTIM_META)
+        self.meta_sched = build_lr_scheduler(self.meta_optim, cfg.OPTIM_META)
         self.register_model("model", self.model, self.optim, self.sched)
         #self.register_model("meta_model", self.meta_model, self.meta_optim, self.meta_sched)
-    
-    def gradient_update(self, loss_ce, loss_kl, reg_image, reg_text):
-
-        ctx = self.model.prompt_learner.ctx
-        vis_ctx = self.model.vision_prompt_learner.ctx
-
-        grad_ce_t = autograd.grad(loss_ce, ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_kl_t = autograd.grad(loss_kl, ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_ce_i = autograd.grad(loss_ce, vis_ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_kl_i = autograd.grad(loss_kl, vis_ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_reg_t = autograd.grad(reg_text, ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_reg_i = autograd.grad(reg_image, vis_ctx, retain_graph=True, create_graph=False)[0].clone()
-
-        grad_ce_t_norm = grad_ce_t / torch.linalg.norm(grad_ce_t)
-        grad_kl_t_norm = grad_kl_t / torch.linalg.norm(grad_kl_t)
-        grad_ce_i_norm = grad_ce_i / torch.linalg.norm(grad_ce_i)
-        grad_kl_i_norm = grad_kl_i / torch.linalg.norm(grad_kl_i)
-        grad_reg_t_norm = grad_reg_t / torch.linalg.norm(grad_reg_t)
-        grad_reg_i_norm = grad_reg_i / torch.linalg.norm(grad_reg_i)
-    
-        angle_t = torch.dot(grad_ce_t_norm.flatten(), grad_reg_t_norm.flatten())
-        angle_i = torch.dot(grad_ce_i_norm.flatten(), grad_reg_i_norm.flatten())
-        if angle_t > 0:
-            ctx.grad = grad_ce_t
-        else:
-            ctx.grad = grad_reg_t
-        
-        if angle_i > 0:
-            vis_ctx.grad = grad_ce_i
-        else:
-            vis_ctx.grad = grad_ce_i + grad_reg_i
-            
-        #ctx.grad = grad_ce_t - 1.0 * torch.dot(grad_ce_t.flatten(), grad_reg_t_norm.flatten()) * grad_reg_t_norm
-
-        # if angle_t < 0:
-        #     ctx.grad = grad_ce_t - 1.0 * torch.dot(grad_ce_t.flatten(), grad_kl_t_norm.flatten()) * grad_kl_t_norm
-        # else:
-        #     ctx.grad = grad_ce_t
-        # if angle_i < 0:
-        #     vis_ctx.grad = grad_ce_i - 1.0 * torch.dot(grad_ce_i.flatten(), grad_kl_i_norm.flatten()) * grad_kl_i_norm
-        # else:
-        #     vis_ctx.grad = grad_ce_i
-    def meta_gradient_update(self, loss_ce, kl_loss, reg_image, reg_text):
-        ctx = self.model.prompt_learner.ctx
-        vis_ctx = self.model.vision_prompt_learner.ctx
-
-        grad_ce_t = autograd.grad(loss_ce, ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_ce_i = autograd.grad(loss_ce, vis_ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_reg_t = autograd.grad(reg_text, ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_reg_i = autograd.grad(reg_image, vis_ctx, retain_graph=True, create_graph=False)[0].clone()
-
-        grad_ce_t_norm = grad_ce_t / torch.linalg.norm(grad_ce_t)
-        grad_ce_i_norm = grad_ce_i / torch.linalg.norm(grad_ce_i)
-        grad_reg_t_norm = grad_reg_t / torch.linalg.norm(grad_reg_t)
-        grad_reg_i_norm = grad_reg_i / torch.linalg.norm(grad_reg_i)
-    
-        angle_t = torch.dot(grad_ce_t_norm.flatten(), grad_reg_t_norm.flatten())
-        angle_i = torch.dot(grad_ce_i_norm.flatten(), grad_reg_i_norm.flatten())
-
-        if angle_t < 0:
-            ctx.grad = grad_ce_t - 1.0 * torch.dot(grad_ce_t.flatten(), grad_reg_t_norm.flatten()) * grad_reg_t_norm
-        else:
-            ctx.grad = grad_ce_t
-        
-        vis_ctx.grad = grad_ce_i
-
-
-    def meta_gradient_update_text(self, loss_ce, kl_loss, reg_image, reg_text):
-        ctx = self.model.prompt_learner.ctx
-        vis_ctx = self.model.vision_prompt_learner.ctx
-
-        grad_ce_t = autograd.grad(loss_ce, ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_reg_t = autograd.grad(reg_text, ctx, retain_graph=True, create_graph=False)[0].clone()
-
-        grad_ce_t_norm = grad_ce_t / torch.linalg.norm(grad_ce_t)
-        grad_reg_t_norm = grad_reg_t / torch.linalg.norm(grad_reg_t)
-    
-        angle_t = torch.dot(grad_ce_t_norm.flatten(), grad_reg_t_norm.flatten())
-        if angle_t > 0:
-            ctx.grad = grad_ce_t
-        else:
-            ctx.grad = grad_reg_t
-        vis_ctx.grad = None
-
-    def meta_gradient_update_image(self, loss_ce, kl_loss, reg_image, reg_text):
-        ctx = self.model.prompt_learner.ctx
-        vis_ctx = self.model.vision_prompt_learner.ctx
-
-        grad_ce_i = autograd.grad(loss_ce, vis_ctx, retain_graph=True, create_graph=False)[0].clone()
-        grad_reg_i = autograd.grad(reg_image, vis_ctx, retain_graph=True, create_graph=False)[0].clone()
-
-        grad_ce_i_norm = grad_ce_i / torch.linalg.norm(grad_ce_i)
-        grad_reg_i_norm = grad_reg_i / torch.linalg.norm(grad_reg_i)
-    
-        angle_i = torch.dot(grad_ce_i_norm.flatten(), grad_reg_i_norm.flatten())
-
-        vis_ctx.grad = grad_ce_i
-        ctx.grad = None
 
     def forward_backward(self, batch):
         #image, image2, label = self.parse_batch_train_2(batch)
         image, label = self.parse_batch_train(batch)
 
         #lr=self.get_current_lr()
-        # logits, kl_loss, reg_image, reg_text = self.model(image)
-        # loss_ce = F.cross_entropy(logits, label)
-        # loss = loss_ce + reg_image + reg_text
-
-        # self.model_backward_and_update(loss)
         logits, kl_loss, reg_image, reg_text = self.model(image)
         loss_ce = F.cross_entropy(logits, label)
 
         self.optim.zero_grad()
-        self.gradient_update(loss_ce, kl_loss, reg_image, reg_text)
+        #self.meta_optim.zero_grad()
+        ctx = self.model.prompt_learner.ctx
+        vis_ctx = self.model.vision_prompt_learner.ctx
+        grads_wrt_ctx_0 = autograd.grad(loss_ce, ctx, retain_graph=True)[0]
+        grads_wrt_ctx_1 = autograd.grad(kl_loss*100, ctx, retain_graph=True)[0]
+        self.meta_model.update_grads(params=ctx, grads_list=[grads_wrt_ctx_0, grads_wrt_ctx_1])
+
+        grads_wrt_vis_0 = autograd.grad(loss_ce, vis_ctx, retain_graph=True)[0]
+        grads_wrt_vis_1 = autograd.grad(kl_loss*100, vis_ctx, retain_graph=True)[0]
+        self.meta_model.update_grads(params=vis_ctx, grads_list=[grads_wrt_vis_0, grads_wrt_vis_1])
         self.optim.step()
-
-        # loss_ce, kl_loss, reg_image, reg_text = self.model.forward_mix(image, label)
-
-        # self.optim.zero_grad()
-        # #loss.backward()
-        # self.meta_gradient_update_image(loss_ce, kl_loss, reg_image, reg_text)
-        # self.optim.step()
-
-        loss_ce, kl_loss, reg_image, reg_text = self.model.forward_mix(image, label)
-
-        self.optim.zero_grad()
-        self.meta_gradient_update(loss_ce, kl_loss, reg_image, reg_text)
-        self.optim.step()
-
-        # loss = torch.tensor(0.0)
-        # unique_label = torch.unique(label)
-        # maml_ = maml.MAML(self.model, lr=self.adapt_lr, first_order=self.fast_adaptation)
-        # if len(unique_label) != 1:
-        #     qry_l = unique_label[torch.randperm(len(unique_label))][0]
-        #     qry_ids = torch.where(label==qry_l)[0]
-        #     sup_ids = torch.where(label!=qry_l)[0]
-        #     x_sup, y_sup = image[sup_ids], label[sup_ids]
-        #     x_qry, y_qry = image[qry_ids], label[qry_ids]
-
-        #     b_size = x_qry.size(0)
-        #     lam = torch.distributions.beta.Beta(0.5, 0.5).sample((b_size,)).to(image.device)
-        #     mix_ids = torch.randint(x_sup.size(0), (x_qry.size(0),))
-
-        #     task_model = maml_.clone(allow_nograd=True)
-        #     adaptation_logits_ce, kl_loss, adaptation_rag_image, adaptation_rag_text = task_model(x_sup)
-        #     adaptation_loss_ce = F.cross_entropy(adaptation_logits_ce, y_sup)
-            
-        #     task_model.adapt(adaptation_loss_ce, kl_loss, adaptation_rag_image, adaptation_rag_text, allow_nograd=True, grad_func=None, allow_unused=True)
-        #     loss_ce, kl_loss, rag_image, rag_text = task_model.forward_mix(x_qry, y_qry, x_sup, y_sup, mix_ids, lam=lam) 
-
-        #     #loss = loss2_ce + rag_image + rag_text
-        #     loss = loss_ce
-        #     self.optim.zero_grad()
-        #     #self.gradient_update(loss2_ce, kl_loss, rag_image, rag_text)
-        #     loss.backward()
-        #     self.optim.step()
+        #self.meta_optim.step()
 
         loss_summary = {
             "loss": loss_ce.item(),
-            #"acc": compute_accuracy(logits, label)[0].item(),
+            "acc": compute_accuracy(logits, label)[0].item(),
         }
 
         if (self.batch_idx + 1) == self.num_batches:
